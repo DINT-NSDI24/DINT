@@ -1,0 +1,4 @@
+shard
+lock
+*.ll
+*.o

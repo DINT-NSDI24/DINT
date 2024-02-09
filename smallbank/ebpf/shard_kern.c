@@ -1,0 +1,741 @@
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include "linux/tools/lib/bpf/bpf_helpers.h"
+
+#include "utils.h"
+
+char LICENSE[] SEC("license") = "GPL";
+static const uint32_t zero = 0;
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __type(key, uint32_t);
+  __type(value, uint32_t);
+  __uint(max_entries, MAX_PROG_NUM);
+} map_progs_xdp SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __type(key, uint32_t);
+  __type(value, uint32_t);
+  __uint(max_entries, MAX_PROG_NUM);
+} map_progs_tc SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, uint32_t);
+  __type(value, struct lock_unit);
+  __uint(max_entries, SAV_HASH_SIZE*KEYS_PER_ENTRY);
+} map_locks_sav SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, uint32_t);
+  __type(value, struct lock_unit);
+  __uint(max_entries, CHK_HASH_SIZE*KEYS_PER_ENTRY);
+} map_locks_chk SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, uint32_t);
+  __type(value, struct cache_entry);
+  __uint(max_entries, SAV_HASH_SIZE);
+} map_cache_sav SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, uint32_t);
+  __type(value, struct cache_entry);
+  __uint(max_entries, CHK_HASH_SIZE);
+} map_cache_chk SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, uint32_t);
+  __type(value, struct log_entry);
+  __uint(max_entries, MAX_LOG_ENTRY_NUM);
+} map_log SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, uint32_t);
+  __type(value, uint32_t);
+  __uint(max_entries, 1);
+} map_log_cnt SEC(".maps");
+
+SEC("tps_prim_xdp")
+int tps_prim_xdp_main(struct xdp_md *ctx) {
+  void *data_end = (void *)(long)ctx->data_end;
+  void *data = (void *)(long)ctx->data;
+
+  struct ethhdr *eth = data;
+  if (eth + 1 > data_end) return XDP_PASS;
+
+  struct iphdr *ip = data + sizeof(*eth);
+  if (ip + 1 > data_end) return XDP_PASS;
+
+  void *transp = data + sizeof(*eth) + sizeof(*ip);
+  struct udphdr *udp = (struct udphdr *)(data + sizeof(*eth) + sizeof(*ip));
+  if (udp + 1 > data_end) return XDP_PASS;
+
+  char *payload = transp + sizeof(*udp);
+  struct message *msg = (struct message *)payload;
+  if (msg + 1 > data_end) return XDP_PASS;
+
+  if (udp->dest != htons(FASST_PORT)) return XDP_PASS;
+  if (msg->type != ACQUIRE_SHARED && msg->type != ACQUIRE_EXCLUSIVE &&
+      msg->type != RELEASE_SHARED && msg->type != RELEASE_EXCLUSIVE &&
+      msg->type != COMMIT_PRIM && msg->type != COMMIT_BCK &&
+      msg->type != COMMIT_LOG && msg->type != WARMUP_READ) 
+    return XDP_PASS;
+
+  uint64_t hash = fasthash64(&msg->key, sizeof(msg->key), 0xdeadbeef);
+
+  if (msg->type == ACQUIRE_SHARED) {
+    uint32_t kvs_hash;
+    struct cache_entry *e;
+    switch (msg->table) {
+      case SAVING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)SAV_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_sav, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      case CHECKING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)CHK_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_chk, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    struct lock_unit *lu;
+    uint32_t lock_hash;
+    switch (msg->table) {
+      case SAVING:
+        lock_hash = (uint32_t)(hash % (uint64_t)(SAV_HASH_SIZE*KEYS_PER_ENTRY));
+        lu = bpf_map_lookup_elem(&map_locks_sav, &lock_hash);
+        if (!lu) return XDP_PASS;
+        break;
+      case CHECKING:
+        lock_hash = (uint32_t)(hash % (uint64_t)(CHK_HASH_SIZE*KEYS_PER_ENTRY));
+        lu = bpf_map_lookup_elem(&map_locks_chk, &lock_hash);
+        if (!lu) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    uint64_t ret = __sync_val_compare_and_swap(&lu->lock, 0, 1);
+    if (ret == 1) {
+      msg->type = RETRY;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    }
+
+    if (lu->num_ex > 0) {
+      __sync_val_compare_and_swap(&lu->lock, 1, 0);
+      msg->type = REJECT_SHARED;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    } else {
+      lu->num_sh++;
+      __sync_val_compare_and_swap(&lu->lock, 1, 0);
+
+      ret = __sync_val_compare_and_swap(&e->lock, 0, 1);
+      if (ret == 1) {
+        msg->type = RETRY;
+        prepare_packet(eth, ip, udp);
+        return XDP_TX;
+      }
+
+      int idx;
+      for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+        if (e->key[idx] == msg->key && e->valid[idx] == 1) break;
+      }
+
+      if (idx < KEYS_PER_ENTRY) {
+        msg->type = GRANT_SHARED;
+        msg->ver = e->ver[idx];
+        memcpy(msg->val, e->val[idx], VAL_SIZE);
+
+        __sync_val_compare_and_swap(&e->lock, 1, 0);
+
+        prepare_packet(eth, ip, udp);
+        return XDP_TX;
+      } else {
+        bpf_xdp_adjust_tail(ctx, sizeof(struct ext_message)-sizeof(struct message));
+        data_end = (void *)(long)ctx->data_end;
+        data = (void *)(long)ctx->data;
+
+        eth = data;
+        if (eth + 1 > data_end) return XDP_PASS;
+
+        ip = data + sizeof(*eth);
+        if (ip + 1 > data_end) return XDP_PASS;
+
+        transp = data + sizeof(*eth) + sizeof(*ip);
+        udp = (struct udphdr *)(data + sizeof(*eth) + sizeof(*ip));
+        if (udp + 1 > data_end) return XDP_PASS;
+
+        adjust_packet_len(ip, udp, (int)(sizeof(struct ext_message))-(int)(sizeof(struct message)));
+
+        payload = transp + sizeof(*udp);
+        struct ext_message *ext_msg = (struct ext_message *)payload;
+        if (ext_msg + 1 > data_end) return XDP_PASS;
+
+        int idx;
+        for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+          if (e->valid[idx] == 0) break;
+        }
+        if (idx == KEYS_PER_ENTRY) {
+          for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+            if (e->dirty[idx] == 0) break;
+          }
+        }
+        if (idx == KEYS_PER_ENTRY) idx = 0;
+        ext_msg->idx = idx;
+
+        if (e->valid[idx] == 1 && e->dirty[idx] == 1) {
+          ext_msg->key2 = e->key[idx];
+          memcpy(ext_msg->val2, e->val[idx], VAL_SIZE);
+          ext_msg->ver2 = e->ver[idx];
+          ext_msg->ver1 = 1;
+        } else ext_msg->ver1 = 0;
+
+        return XDP_PASS;
+      }
+    }
+  }
+
+  else if (msg->type == ACQUIRE_EXCLUSIVE) {
+    uint32_t kvs_hash;
+    struct cache_entry *e;
+    switch (msg->table) {
+      case SAVING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)SAV_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_sav, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      case CHECKING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)CHK_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_chk, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    struct lock_unit *lu;
+    uint32_t lock_hash;
+    switch (msg->table) {
+      case SAVING:
+        lock_hash = (uint32_t)(hash % (uint64_t)(SAV_HASH_SIZE*KEYS_PER_ENTRY));
+        lu = bpf_map_lookup_elem(&map_locks_sav, &lock_hash);
+        if (!lu) return XDP_PASS;
+        break;
+      case CHECKING:
+        lock_hash = (uint32_t)(hash % (uint64_t)(CHK_HASH_SIZE*KEYS_PER_ENTRY));
+        lu = bpf_map_lookup_elem(&map_locks_chk, &lock_hash);
+        if (!lu) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    uint64_t ret = __sync_val_compare_and_swap(&lu->lock, 0, 1);
+    if (ret == 1) {
+      msg->type = RETRY;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    }
+
+    if (lu->num_ex > 0 || lu->num_sh > 0) {
+      __sync_val_compare_and_swap(&lu->lock, 1, 0);
+      msg->type = REJECT_EXCLUSIVE;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    } else {
+      lu->num_ex++;
+      __sync_val_compare_and_swap(&lu->lock, 1, 0);
+
+      ret = __sync_val_compare_and_swap(&e->lock, 0, 1);
+      if (ret == 1) {
+        msg->type = RETRY;
+        prepare_packet(eth, ip, udp);
+        return XDP_TX;
+      }
+
+      int idx;
+      for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+        if (e->key[idx] == msg->key && e->valid[idx] == 1) break;
+      }
+
+      if (idx < KEYS_PER_ENTRY) {
+        msg->type = GRANT_EXCLUSIVE;
+        msg->ver = e->ver[idx];
+        memcpy(msg->val, e->val[idx], VAL_SIZE);
+
+        __sync_val_compare_and_swap(&e->lock, 1, 0);
+
+        prepare_packet(eth, ip, udp);
+        return XDP_TX;
+      } else {
+        bpf_xdp_adjust_tail(ctx, sizeof(struct ext_message)-sizeof(struct message));
+        data_end = (void *)(long)ctx->data_end;
+        data = (void *)(long)ctx->data;
+
+        eth = data;
+        if (eth + 1 > data_end) return XDP_PASS;
+
+        ip = data + sizeof(*eth);
+        if (ip + 1 > data_end) return XDP_PASS;
+
+        transp = data + sizeof(*eth) + sizeof(*ip);
+        udp = (struct udphdr *)(data + sizeof(*eth) + sizeof(*ip));
+        if (udp + 1 > data_end) return XDP_PASS;
+
+        adjust_packet_len(ip, udp, (int)(sizeof(struct ext_message))-(int)(sizeof(struct message)));
+
+        payload = transp + sizeof(*udp);
+        struct ext_message *ext_msg = (struct ext_message *)payload;
+        if (ext_msg + 1 > data_end) return XDP_PASS;
+
+        int idx;
+        for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+          if (e->valid[idx] == 0) break;
+        }
+        if (idx == KEYS_PER_ENTRY) {
+          for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+            if (e->dirty[idx] == 0) break;
+          }
+        }
+        if (idx == KEYS_PER_ENTRY) idx = 0;
+        ext_msg->idx = idx;
+
+        if (e->valid[idx] == 1 && e->dirty[idx] == 1) {
+          ext_msg->key2 = e->key[idx];
+          memcpy(ext_msg->val2, e->val[idx], VAL_SIZE);
+          ext_msg->ver2 = e->ver[idx];
+          ext_msg->ver1 = 1;
+        } else ext_msg->ver1 = 0;
+
+        return XDP_PASS;
+      }
+    }
+  }
+
+  else if (msg->type == RELEASE_SHARED) {
+    struct lock_unit *lu;
+    uint32_t lock_hash;
+    switch (msg->table) {
+      case SAVING:
+        lock_hash = (uint32_t)(hash % (uint64_t)(SAV_HASH_SIZE*KEYS_PER_ENTRY));
+        lu = bpf_map_lookup_elem(&map_locks_sav, &lock_hash);
+        if (!lu) return XDP_PASS;
+        break;
+      case CHECKING:
+        lock_hash = (uint32_t)(hash % (uint64_t)(CHK_HASH_SIZE*KEYS_PER_ENTRY));
+        lu = bpf_map_lookup_elem(&map_locks_chk, &lock_hash);
+        if (!lu) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    uint64_t ret = __sync_val_compare_and_swap(&lu->lock, 0, 1);
+    if (ret == 1) {
+      msg->type = RETRY;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    }
+
+    lu->num_sh--;
+    __sync_val_compare_and_swap(&lu->lock, 1, 0);
+    msg->type = RELEASE_SHARED_ACK;
+    prepare_packet(eth, ip, udp);
+    return XDP_TX;
+  }
+
+  else if (msg->type == RELEASE_EXCLUSIVE) {
+    struct lock_unit *lu;
+    uint32_t lock_hash;
+    switch (msg->table) {
+      case SAVING:
+        lock_hash = (uint32_t)(hash % (uint64_t)(SAV_HASH_SIZE*KEYS_PER_ENTRY));
+        lu = bpf_map_lookup_elem(&map_locks_sav, &lock_hash);
+        if (!lu) return XDP_PASS;
+        break;
+      case CHECKING:
+        lock_hash = (uint32_t)(hash % (uint64_t)(CHK_HASH_SIZE*KEYS_PER_ENTRY));
+        lu = bpf_map_lookup_elem(&map_locks_chk, &lock_hash);
+        if (!lu) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    uint64_t ret = __sync_val_compare_and_swap(&lu->lock, 0, 1);
+    if (ret == 1) {
+      msg->type = RETRY;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    }
+
+    lu->num_ex--;
+    __sync_val_compare_and_swap(&lu->lock, 1, 0);
+    msg->type = RELEASE_EXCLUSIVE_ACK;
+    prepare_packet(eth, ip, udp);
+    return XDP_TX;
+  }
+
+  else if (msg->type == COMMIT_PRIM) {
+    uint32_t kvs_hash;
+    struct cache_entry *e;
+    switch (msg->table) {
+      case SAVING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)SAV_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_sav, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      case CHECKING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)CHK_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_chk, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    uint64_t ret = __sync_val_compare_and_swap(&e->lock, 0, 1);
+    if (ret == 1) {
+      msg->type = RETRY;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    }
+
+    int idx;
+    for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+      if (e->key[idx] == msg->key && e->valid[idx] == 1) break;
+    }
+    
+    if (idx < KEYS_PER_ENTRY) {
+      // using memcpy here would cause exceeded stack space
+      // this happens only with VAL_SIZE >= 64
+      memcpy(e->val[idx], msg->val, VAL_SIZE);
+
+      e->ver[idx]++;
+      e->dirty[idx] = 1;
+      __sync_val_compare_and_swap(&e->lock, 1, 0);
+
+      msg->type = COMMIT_PRIM_ACK;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    } else {
+      bpf_xdp_adjust_tail(ctx, sizeof(struct ext_message)-sizeof(struct message));
+      data_end = (void *)(long)ctx->data_end;
+      data = (void *)(long)ctx->data;
+
+      eth = data;
+      if (eth + 1 > data_end) return XDP_PASS;
+
+      ip = data + sizeof(*eth);
+      if (ip + 1 > data_end) return XDP_PASS;
+
+      transp = data + sizeof(*eth) + sizeof(*ip);
+      udp = (struct udphdr *)(data + sizeof(*eth) + sizeof(*ip));
+      if (udp + 1 > data_end) return XDP_PASS;
+
+      adjust_packet_len(ip, udp, (int)(sizeof(struct ext_message))-(int)(sizeof(struct message)));
+
+      payload = transp + sizeof(*udp);
+      struct ext_message *ext_msg = (struct ext_message *)payload;
+      if (ext_msg + 1 > data_end) return XDP_PASS;
+
+      int idx;
+      for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+        if (e->valid[idx] == 0) break;
+      }
+      if (idx == KEYS_PER_ENTRY) {
+        for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+          if (e->dirty[idx] == 0) break;
+        }
+      }
+      if (idx == KEYS_PER_ENTRY) idx = 0;
+      ext_msg->idx = idx;
+
+      if (e->valid[idx] == 1 && e->dirty[idx] == 1) {
+        ext_msg->key2 = e->key[idx];
+        memcpy(ext_msg->val2, e->val[idx], VAL_SIZE);
+        ext_msg->ver2 = e->ver[idx];
+        ext_msg->ver1 = 1;
+      } else ext_msg->ver1 = 0;
+
+      return XDP_PASS;
+    }
+  }
+
+  else if (msg->type == COMMIT_BCK) {
+    uint32_t kvs_hash;
+    struct cache_entry *e;
+    switch (msg->table) {
+      case SAVING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)SAV_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_sav, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      case CHECKING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)CHK_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_chk, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    uint64_t ret = __sync_val_compare_and_swap(&e->lock, 0, 1);
+    if (ret == 1) {
+      msg->type = RETRY;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    }
+
+    int idx;
+    for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+      if (e->key[idx] == msg->key && e->valid[idx] == 1) break;
+    }
+    
+    if (idx < KEYS_PER_ENTRY) {
+      // using memcpy here would cause exceeded stack space
+      // this happens only with VAL_SIZE >= 64
+      memcpy(e->val[idx], msg->val, VAL_SIZE);
+
+      e->ver[idx]++;
+      e->dirty[idx] = 1;
+      __sync_val_compare_and_swap(&e->lock, 1, 0);
+
+      msg->type = COMMIT_BCK_ACK;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    } else {
+      bpf_xdp_adjust_tail(ctx, sizeof(struct ext_message)-sizeof(struct message));
+      data_end = (void *)(long)ctx->data_end;
+      data = (void *)(long)ctx->data;
+
+      eth = data;
+      if (eth + 1 > data_end) return XDP_PASS;
+
+      ip = data + sizeof(*eth);
+      if (ip + 1 > data_end) return XDP_PASS;
+
+      transp = data + sizeof(*eth) + sizeof(*ip);
+      udp = (struct udphdr *)(data + sizeof(*eth) + sizeof(*ip));
+      if (udp + 1 > data_end) return XDP_PASS;
+
+      adjust_packet_len(ip, udp, (int)(sizeof(struct ext_message))-(int)(sizeof(struct message)));
+
+      payload = transp + sizeof(*udp);
+      struct ext_message *ext_msg = (struct ext_message *)payload;
+      if (ext_msg + 1 > data_end) return XDP_PASS;
+
+      int idx;
+      for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+        if (e->valid[idx] == 0) break;
+      }
+      if (idx == KEYS_PER_ENTRY) {
+        for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+          if (e->dirty[idx] == 0) break;
+        }
+      }
+      if (idx == KEYS_PER_ENTRY) idx = 0;
+      ext_msg->idx = idx;
+
+      if (e->valid[idx] == 1 && e->dirty[idx] == 1) {
+        ext_msg->key2 = e->key[idx];
+        memcpy(ext_msg->val2, e->val[idx], VAL_SIZE);
+        ext_msg->ver2 = e->ver[idx];
+        ext_msg->ver1 = 1;
+      } else ext_msg->ver1 = 0;
+
+      return XDP_PASS;
+    }
+  }
+
+  else if (msg->type == COMMIT_LOG) {
+    uint32_t *log_cnt = bpf_map_lookup_elem(&map_log_cnt, &zero);
+    if (!log_cnt) return XDP_PASS;
+    struct log_entry *log_entry = bpf_map_lookup_elem(&map_log, log_cnt);
+    if (!log_entry) return XDP_PASS;
+
+    log_entry->table = msg->table;
+    log_entry->key = msg->key;
+    memcpy(log_entry->val, msg->val, VAL_SIZE);
+    log_entry->ver = msg->ver;
+
+    (*log_cnt)++;
+    if (*log_cnt == MAX_LOG_ENTRY_NUM) *log_cnt = 0;
+
+    msg->type = COMMIT_LOG_ACK;
+    prepare_packet(eth, ip, udp);
+    return XDP_TX;
+  }
+
+  else if (msg->type == WARMUP_READ) {
+    uint32_t kvs_hash;
+    struct cache_entry *e;
+    switch (msg->table) {
+      case SAVING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)SAV_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_sav, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      case CHECKING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)CHK_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_chk, &kvs_hash);
+        if (!e) return XDP_PASS;
+        break;
+      default:
+        return XDP_PASS;
+    }
+
+    uint64_t ret = __sync_val_compare_and_swap(&e->lock, 0, 1);
+    if (ret == 1) {
+      msg->type = RETRY;
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    }
+
+    int idx;
+    for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+      if (e->key[idx] == msg->key && e->valid[idx] == 1) break;
+    }
+
+    if (idx < KEYS_PER_ENTRY) {
+      msg->type = GRANT_SHARED;
+      msg->ver = e->ver[idx];
+      memcpy(msg->val, e->val[idx], VAL_SIZE);
+
+      __sync_val_compare_and_swap(&e->lock, 1, 0);
+
+      prepare_packet(eth, ip, udp);
+      return XDP_TX;
+    } else {
+      bpf_xdp_adjust_tail(ctx, sizeof(struct ext_message)-sizeof(struct message));
+      data_end = (void *)(long)ctx->data_end;
+      data = (void *)(long)ctx->data;
+
+      eth = data;
+      if (eth + 1 > data_end) return XDP_PASS;
+
+      ip = data + sizeof(*eth);
+      if (ip + 1 > data_end) return XDP_PASS;
+
+      transp = data + sizeof(*eth) + sizeof(*ip);
+      udp = (struct udphdr *)(data + sizeof(*eth) + sizeof(*ip));
+      if (udp + 1 > data_end) return XDP_PASS;
+
+      adjust_packet_len(ip, udp, (int)(sizeof(struct ext_message))-(int)(sizeof(struct message)));
+
+      payload = transp + sizeof(*udp);
+      struct ext_message *ext_msg = (struct ext_message *)payload;
+      if (ext_msg + 1 > data_end) return XDP_PASS;
+
+      int idx;
+      for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+        if (e->valid[idx] == 0) break;
+      }
+      if (idx == KEYS_PER_ENTRY) {
+        for (idx = 0; idx < KEYS_PER_ENTRY; idx++) {
+          if (e->dirty[idx] == 0) break;
+        }
+      }
+      if (idx == KEYS_PER_ENTRY) idx = 0;
+      ext_msg->idx = idx;
+
+      if (e->valid[idx] == 1 && e->dirty[idx] == 1) {
+        ext_msg->key2 = e->key[idx];
+        memcpy(ext_msg->val2, e->val[idx], VAL_SIZE);
+        ext_msg->ver2 = e->ver[idx];
+        ext_msg->ver1 = 1;
+      } else ext_msg->ver1 = 0;
+
+      return XDP_PASS;
+    }
+  }
+
+  return XDP_PASS;
+}
+
+SEC("tps_prim_tc")
+int tps_prim_tc_main(struct __sk_buff *skb) {
+  void *data_end = (void *)(long)skb->data_end;
+  void *data = (void *)(long)skb->data;
+  struct ethhdr *eth = data;
+  if (eth + 1 > data_end) return TC_ACT_OK;
+
+  struct iphdr *ip = data + sizeof(*eth);
+  if (ip + 1 > data_end) return TC_ACT_OK;
+
+  void *transp = data + sizeof(*eth) + sizeof(*ip);
+  struct udphdr *udp = (struct udphdr *)(data + sizeof(*eth) + sizeof(*ip));
+  if (udp + 1 > data_end) return TC_ACT_OK;
+
+  __be16 sport = udp->source;
+  if (sport != htons(FASST_PORT)) return TC_ACT_OK;
+
+  char *payload = transp + sizeof(*udp);
+  struct ext_message *ext_msg = (struct ext_message *)payload;
+  if (ext_msg + 1 > data_end) return TC_ACT_OK;
+
+  uint64_t hash = fasthash64(&ext_msg->key1, sizeof(ext_msg->key1), 0xdeadbeef);
+
+  if (ext_msg->type == GRANT_SHARED || ext_msg->type == GRANT_EXCLUSIVE || 
+      ext_msg->type == COMMIT_PRIM_ACK || ext_msg->type == COMMIT_BCK_ACK ||
+      ext_msg->type == WARMUP_READ_ACK) {
+    uint32_t kvs_hash;
+    struct cache_entry *e;
+    switch (ext_msg->table) {
+      case SAVING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)SAV_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_sav, &kvs_hash);
+        if (!e) return TC_ACT_OK;
+        break;
+      case CHECKING:
+        kvs_hash = (uint32_t)(hash % (uint64_t)CHK_HASH_SIZE);
+        e = bpf_map_lookup_elem(&map_cache_chk, &kvs_hash);
+        if (!e) return TC_ACT_OK;
+        break;
+      default:
+        return TC_ACT_OK;
+    }
+    
+    int idx = ext_msg->idx;
+    if (idx >= KEYS_PER_ENTRY) return TC_ACT_OK;
+    e->key[idx] = ext_msg->key1;
+    memcpy(e->val[idx], ext_msg->val1, VAL_SIZE);
+    e->ver[idx] = ext_msg->ver1;
+    e->dirty[idx] = 0;
+    e->valid[idx] = 1;
+
+    __sync_val_compare_and_swap(&e->lock, 1, 0);
+  }
+  
+  bpf_skb_change_tail(skb, skb->len + sizeof(struct message)-sizeof(struct ext_message), 0);
+
+  data_end = (void *)(long)skb->data_end;
+  data = (void *)(long)skb->data;
+  eth = data;
+  if (eth + 1 > data_end) return TC_ACT_OK;
+
+  ip = data + sizeof(*eth);
+  if (ip + 1 > data_end) return TC_ACT_OK;
+
+  transp = data + sizeof(*eth) + sizeof(*ip);
+  udp = (struct udphdr *)(data + sizeof(*eth) + sizeof(*ip));
+  if (udp + 1 > data_end) return TC_ACT_OK;
+
+  adjust_packet_len(ip, udp, (int)(sizeof(struct message))-(int)(sizeof(struct ext_message)));
+  return TC_ACT_OK;
+}

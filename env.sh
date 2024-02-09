@@ -1,0 +1,6 @@
+#!/bin/bash
+
+LS_BASE_PATH="$(pwd)/$1"
+LS_KERNEL_VERSION=$2
+LS_KERNEL_TARXZ="${LS_BASE_PATH}/linux-${LS_KERNEL_VERSION}.tar.xz"
+LS_PATH="${LS_BASE_PATH}/ebpf"

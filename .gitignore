@@ -1,0 +1,47 @@
+# Mac
+.DS_Store
+
+.vscode
+
+traces/
+new_traces/
+
+linux/
+linux-*.tar.xz
+
+# Playground
+playground/
+
+*.pcap
+
+# Backup file
+*.bak
+*.bak.*
+
+# Python byte code
+*.pyc
+
+# Object file
+*.d
+*.o
+*.a
+
+*.e
+
+# Temp file
+*.swp
+*.tmp
+tmp.*
+
+# Figures
+!*.pdf
+
+# Function code
+simulator.py
+
+*.zip
+
+*.res
+*.log
+*_bak/
+.ipynb_checkpoints/

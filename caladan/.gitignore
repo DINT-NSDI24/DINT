@@ -1,0 +1,11 @@
+*.d
+*.o
+*.a
+[._]*.sw[a-p]
+iokerneld
+*~
+.cproject
+.project
+.vscode
+.DS_Store
+latency_*.txt
